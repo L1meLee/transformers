@@ -4300,7 +4300,7 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                     del data
                     gc.collect()
 
-                    # parse parameters
+                    # load parameters
                     with load_state_dict_lock:
                         # Mistmatched keys contains tuples key/shape1/shape2 of weights in the checkpoint that have a shape not
                         # matching the weights in the model.
@@ -4318,12 +4318,16 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                         gc.collect()
 
                 with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-                    futures = [executor.submit(process_shard, shard_file, mismatched_keys, error_msgs) for shard_file in resolved_archive_file]
-                    for future in as_completed(futures):
-                        try:
-                            future.result()
-                        except Exception as e:
-                            logger.error(f"Concurrent Load CheckPoint Files Error occurred: {e}")
+                    with logging.tqdm(total=len(resolved_archive_file), desc="Loading checkpoint shards") as pbar:
+
+                        futures = [executor.submit(process_shard, shard_file, mismatched_keys, error_msgs) for shard_file in resolved_archive_file]
+                        for future in as_completed(futures):
+                            try:
+                                future.result()
+                            except Exception as e:
+                                logger.error(f"Concurrent Load CheckPoint Files Error occurred: {e}")
+                            finally:
+                                pbar.update(1)
             else:
                 for shard_file in resolved_archive_file:
                     # Skip the load for shards that only contain disk-offloaded weights when using safetensors for the offload.
