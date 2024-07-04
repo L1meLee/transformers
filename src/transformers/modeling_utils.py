@@ -4274,8 +4274,8 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
             else:
                 disk_only_shard_files = []
 
-            if len(resolved_archive_file) > 1:
-                resolved_archive_file = logging.tqdm(resolved_archive_file, desc="Loading checkpoint shards")
+            # if len(resolved_archive_file) > 1:
+            #     resolved_archive_file = logging.tqdm(resolved_archive_file, desc="Loading checkpoint shards")
 
 
             ## modified code start
@@ -4292,10 +4292,15 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                     # Skip the load for shards that only contain disk-offloaded weights when using safetensors for the offload.
                     if shard_file in disk_only_shard_files:
                         return
+
+                    # read file
                     with open(shard_file,"rb") as f:
                         data = f.read()
                     state_dict = safe_load(data)
+                    del data
+                    gc.collect()
 
+                    # parse parameters
                     with load_state_dict_lock:
                         # Mistmatched keys contains tuples key/shape1/shape2 of weights in the checkpoint that have a shape not
                         # matching the weights in the model.
