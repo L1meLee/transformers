@@ -4284,11 +4284,11 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                 if not shard_file.endswith(".safetensors"):
                     is_format_safetensors = False
 
-            if threads > 0 and is_format_safetensors and is_safetensors_available():
+            if threads > 0 and is_format_safetensors and is_safetensors_available() and not low_cpu_mem_usage:
                 load_state_dict_lock = Lock()
                 MAX_THREADS = threads
 
-                def process_shard(shard_file, mismatched_keys, error_msgs, offload_index, state_dict_index):
+                def process_shard(shard_file, mismatched_keys, error_msgs):
                     # Skip the load for shards that only contain disk-offloaded weights when using safetensors for the offload.
                     if shard_file in disk_only_shard_files:
                         return
@@ -4312,42 +4312,13 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                             remove_prefix_from_model,
                             ignore_mismatched_sizes,
                         )
-                        if low_cpu_mem_usage:
-                            if is_fsdp_enabled() and not is_local_dist_rank_0() and not is_quantized:
-                                for key, param in model_to_load.state_dict().items():
-                                    if param.device == torch.device("meta"):
-                                        set_module_tensor_to_device(
-                                            model_to_load, key, "cpu", torch.empty(*param.size(), dtype=dtype)
-                                        )
-                            else:
-                                new_error_msgs, offload_index, state_dict_index = _load_state_dict_into_meta_model(
-                                    model_to_load,
-                                    state_dict,
-                                    loaded_keys,
-                                    start_prefix,
-                                    expected_keys,
-                                    device_map=device_map,
-                                    offload_folder=offload_folder,
-                                    offload_index=offload_index,
-                                    state_dict_folder=state_dict_folder,
-                                    state_dict_index=state_dict_index,
-                                    dtype=dtype,
-                                    hf_quantizer=hf_quantizer,
-                                    is_safetensors=is_safetensors,
-                                    keep_in_fp32_modules=keep_in_fp32_modules,
-                                    unexpected_keys=unexpected_keys,
-                                )
-                                error_msgs += new_error_msgs
-                        else:
-                            error_msgs += _load_state_dict_into_model(model_to_load, state_dict, start_prefix)
-
+                        error_msgs += _load_state_dict_into_model(model_to_load, state_dict, start_prefix)
                         # force memory release
                         del state_dict
                         gc.collect()
 
                 with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-                    futures = [executor.submit(process_shard, shard_file, mismatched_keys, error_msgs, offload_index,
-                                               state_dict_index) for shard_file in resolved_archive_file]
+                    futures = [executor.submit(process_shard, shard_file, mismatched_keys, error_msgs) for shard_file in resolved_archive_file]
                     for future in as_completed(futures):
                         try:
                             future.result()
