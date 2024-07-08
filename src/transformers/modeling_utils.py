@@ -25,11 +25,12 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial, wraps
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 from zipfile import is_zipfile
@@ -40,6 +41,7 @@ from packaging import version
 from torch import Tensor, nn
 from torch.nn import CrossEntropyLoss, Identity
 from torch.utils.checkpoint import checkpoint
+import tqdm
 
 from .activations import get_activation
 from .configuration_utils import PretrainedConfig
@@ -3830,7 +3832,6 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
             # restore default dtype
             if dtype_orig is not None:
                 torch.set_default_dtype(dtype_orig)
-
             (
                 model,
                 missing_keys,
@@ -3855,7 +3856,7 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                 hf_quantizer=hf_quantizer,
                 keep_in_fp32_modules=keep_in_fp32_modules,
                 gguf_path=gguf_path,
-                threads=threads,
+                processes=threads,
             )
 
         # make sure token embedding weights are still tied if needed
@@ -3932,6 +3933,16 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
         return model
 
     @classmethod
+    def process_shard(cls, shard_file):
+        # read file
+        with open(shard_file, "rb") as f:
+            data = f.read()
+        state_dict = safe_load(data)
+        del data
+        gc.collect()
+        return state_dict
+
+    @classmethod
     def _load_pretrained_model(
         cls,
         model,
@@ -3950,7 +3961,7 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
         hf_quantizer=None,
         keep_in_fp32_modules=None,
         gguf_path=None,
-        threads=-1,
+        processes=-1,
     ):
         is_safetensors = False
         is_quantized = hf_quantizer is not None
@@ -4284,50 +4295,40 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
                 if not shard_file.endswith(".safetensors"):
                     is_format_safetensors = False
 
-            if threads > 0 and is_format_safetensors and is_safetensors_available() and not low_cpu_mem_usage:
-                load_state_dict_lock = Lock()
-                MAX_THREADS = threads
+            if processes > 0 and is_format_safetensors and is_safetensors_available() and not low_cpu_mem_usage:
+                MAX_PROCESSES =processes
+                with tqdm.tqdm(total=len(resolved_archive_file), desc="Loading checkpoint shards") as pbar:
+                    with ProcessPoolExecutor(max_workers=MAX_PROCESSES) as executor:
+                        futures = []
+                        for shard_file in resolved_archive_file:
+                            if shard_file in disk_only_shard_files:
+                                continue
+                            future = executor.submit(cls.process_shard, shard_file)
+                            futures.append(future)
 
-                def process_shard(shard_file, mismatched_keys, error_msgs):
-                    # Skip the load for shards that only contain disk-offloaded weights when using safetensors for the offload.
-                    if shard_file in disk_only_shard_files:
-                        return
-
-                    # read file
-                    with open(shard_file,"rb") as f:
-                        data = f.read()
-                    state_dict = safe_load(data)
-                    del data
-                    gc.collect()
-
-                    # load parameters
-                    with load_state_dict_lock:
-                        # Mistmatched keys contains tuples key/shape1/shape2 of weights in the checkpoint that have a shape not
-                        # matching the weights in the model.
-                        mismatched_keys += _find_mismatched_keys(
-                            state_dict,
-                            model_state_dict,
-                            original_loaded_keys,
-                            add_prefix_to_model,
-                            remove_prefix_from_model,
-                            ignore_mismatched_sizes,
-                        )
-                        error_msgs += _load_state_dict_into_model(model_to_load, state_dict, start_prefix)
-                        # force memory release
-                        del state_dict
-                        gc.collect()
-
-                with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-                    with logging.tqdm(total=len(resolved_archive_file), desc="Loading checkpoint shards") as pbar:
-
-                        futures = [executor.submit(process_shard, shard_file, mismatched_keys, error_msgs) for shard_file in resolved_archive_file]
                         for future in as_completed(futures):
                             try:
-                                future.result()
+                                state_dict = future.result()
+                                #Mistmatched keys contains tuples key/shape1/shape2 of weights in the checkpoint that have a shape not
+                                # matching the weights in the model.
+                                mismatched_keys += _find_mismatched_keys(
+                                    state_dict,
+                                    model_state_dict,
+                                    original_loaded_keys,
+                                    add_prefix_to_model,
+                                    remove_prefix_from_model,
+                                    ignore_mismatched_sizes,
+                                )
+                                error_msgs += _load_state_dict_into_model(model_to_load, state_dict, start_prefix)
+                                del state_dict
+                                gc.collect()
                             except Exception as e:
                                 logger.error(f"Concurrent Load CheckPoint Files Error occurred: {e}")
                             finally:
                                 pbar.update(1)
+
+
+
             else:
                 for shard_file in resolved_archive_file:
                     # Skip the load for shards that only contain disk-offloaded weights when using safetensors for the offload.
